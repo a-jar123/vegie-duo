@@ -1,0 +1,1017 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Cuphead Prototype - Phase 34: Animated Transition Fix</title>
+    <style>
+        body { background-color: #333; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        canvas { border: 4px solid black; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        let gravity = 0.8;
+        let friction = 0.8;
+        let keys = {};
+        let bullets = []; 
+        let enemyProjectiles = []; 
+        
+        // --- VISIBILITY AND HEALTH CONSTANTS ---
+        let SHOW_HITBOXES = false; 
+        const BOSS_HP_MULTIPLIER = 10; 
+        const PHASE_TWO_HP = 5 * BOSS_HP_MULTIPLIER; // Boss phase change threshold
+        const PARRY_DAMAGE = 10; 
+        const PLAYER_INVULN_TIME = 60; 
+        
+        // --- GAME STATE CONTROL ---
+        let gameState = 'INTRO'; 
+        let phaseTransitionTimer = 0;
+        const PHASE_TRANSITION_TIME = 180; // Longer timer for animated transition
+
+        const PLAYER_BOTTOM_Y = 500; 
+        const BOSS_BOTTOM_Y = 500;
+        const BOSS_START_Y = canvas.height + 10; 
+        
+        // --- Phase 1 Ground Spots ---
+        const GROUND_SPOTS = [
+            { x: 50, y: BOSS_BOTTOM_Y },  
+            { x: 650, y: BOSS_BOTTOM_Y } 
+        ];
+
+        const platforms = [
+            { x: 250, y: 300, width: 300, height: 20 },
+            { x: 50, y: 400, width: 150, height: 20 },
+            { x: 600, y: 400, width: 150, height: 20 }
+        ];
+
+        const player = {
+            x: 100, y: 400, 
+            width: 40, height: 40, originalHeight: 40, crouchHeight: 20, 
+            velX: 0, velY: 0, speed: 5, jump: -15, grounded: false,
+            hp: 5, facingRight: true, 
+            isDashing: false, dashDuration: 0, maxDashTime: 10, dashSpeed: 20,
+            canDash: true, dashCooldown: 60, 
+            isCrouching: false,
+            isLocked: false,
+            shotTimer: 0, shotRate: 5, 
+            weapon: 'peashooter',
+            invulnTimer: 0 
+        };
+        
+        const weapons = {
+            peashooter: {
+                rate: 10, damage: 1, speed: 12, size: { width: 10, height: 5 }, color: 'white', isHoming: false
+            },
+            chaser: {
+                rate: 15, damage: 0.5, speed: 6, size: { width: 6, height: 6 }, color: 'blue', isHoming: true
+            }
+        };
+        
+        const boss = {
+            x: 600, y: BOSS_START_Y, width: 100, height: 100, originalWidth: 100, originalHeight: 100,
+            color: 'orange', 
+            hp: 10 * BOSS_HP_MULTIPLIER, 
+            dir: -1, speed: 2, bossRunSpeed: 2.5,
+            attackTimer: 0, attackRate: 150,
+            currentPhase: 1, 
+            velX: 0, 
+            velY: 0, 
+            isGrounded: true,
+            jumpCooldown: 0,
+            jumpRate: 120,
+            isJumping: false,
+            damageFlashTimer: 0,
+            introTimer: 180, 
+            isMovingIntro: true,
+            phaseOneProjectileSpeed: 1.0, 
+            phaseTwoProjectileSpeed: 3.5,
+            
+            // Phase 1 Dig Movement State
+            moveState: 'RISING', // RISING, ATTACKING, DIGGING, TRANSFORMING
+            digTimer: 180,
+            maxDigTime: 180,
+            targetSpot: null,
+            targetX: 0, 
+            targetY: 0
+        };
+
+        function angleTo(x1, y1, x2, y2) {
+            return Math.atan2(y2 - y1, x2 - x1);
+        }
+        
+        function switchWeapon() {
+            player.weapon = (player.weapon === 'peashooter') ? 'chaser' : 'peashooter';
+            player.shotRate = weapons[player.weapon].rate;
+            player.shotTimer = 0;
+        }
+
+        document.addEventListener('keydown', function(e) {
+            keys[e.code] = true;
+            if (e.code === 'KeyZ') { player.isLocked = true; }
+            if (e.code === 'KeyX') { switchWeapon(); }
+            if (e.code === 'ShiftLeft' && !player.isDashing && player.canDash && gameState === 'FIGHT') {
+                player.isDashing = true;
+                player.dashDuration = player.maxDashTime;
+                player.canDash = false; 
+            }
+            if (e.code === 'KeyT') {
+                SHOW_HITBOXES = !SHOW_HITBOXES;
+            }
+        });
+        document.addEventListener('keyup', function(e) { 
+            keys[e.code] = false; 
+            if (e.code === 'KeyZ') { player.isLocked = false; }
+        });
+
+        function takeDamage(target, damage, knockback=true) {
+            if (target === player) {
+                if (player.invulnTimer > 0) return;
+                
+                player.hp -= damage;
+                player.invulnTimer = PLAYER_INVULN_TIME; 
+
+                if (knockback) {
+                    player.velX = (player.x < boss.x) ? -10 : 10;
+                    player.velY = -5;
+                }
+                if (player.hp <= 0) { gameState = 'GAME_OVER'; }
+
+            } else if (target === boss) {
+                // Prevent damage during transition/transformation
+                if (boss.moveState === 'TRANSFORMING') return; 
+                
+                boss.hp -= damage;
+                boss.damageFlashTimer = 5; 
+                if (boss.hp <= 0) { 
+                    boss.hp = 0; 
+                    gameState = 'BOSS_DEFEATED';
+                }
+            }
+        }
+
+        function firePlayerBullet() {
+            // No shooting during intro, transition, or transformation
+            if (gameState !== 'FIGHT' || boss.moveState === 'TRANSFORMING') return; 
+
+            const currentWeapon = weapons[player.weapon];
+            if (keys['Space'] && player.shotTimer <= 0) { 
+                player.shotTimer = currentWeapon.rate; 
+                
+                let bulletVelX = 0;
+                let bulletVelY = 0;
+                let angle = 0;
+                
+                if (currentWeapon.isHoming) {
+                    angle = angleTo(player.x, player.y, boss.x + boss.width/2, boss.y + boss.height/2);
+                    bulletVelX = Math.cos(angle) * currentWeapon.speed;
+                    bulletVelY = Math.sin(angle) * currentWeapon.speed;
+                }
+                
+                else { 
+                    let shootingUp = keys['ArrowUp'] || keys['KeyW'];
+                    let shootingDown = keys['ArrowDown'] || keys['KeyS'];
+                    let isLocked = player.isLocked || shootingUp || shootingDown; 
+                    
+                    if (isLocked) {
+                        if (shootingUp) { 
+                            bulletVelY = -currentWeapon.speed;
+                        } else if (shootingDown) { 
+                            bulletVelY = currentWeapon.speed; 
+                        } else { 
+                            bulletVelX = player.facingRight ? currentWeapon.speed : -currentWeapon.speed;
+                        }
+                    } else {
+                        bulletVelX = player.facingRight ? currentWeapon.speed : -currentWeapon.speed;
+                    }
+                }
+
+                if (bulletVelX !== 0 || bulletVelY !== 0 || currentWeapon.isHoming) { 
+                    bullets.push({
+                        x: player.x + player.width/2, y: player.y + player.height/2,
+                        velX: bulletVelX, velY: bulletVelY, 
+                        angle: angle, damage: currentWeapon.damage,
+                        type: player.weapon, color: currentWeapon.color, 
+                        width: currentWeapon.size.width, height: currentWeapon.size.height
+                    });
+                }
+            }
+        }
+
+        function checkPlatformCollision() {
+            let onPlatform = false;
+            
+            for (let p of platforms) {
+                const horizontalOverlap = player.x + player.width > p.x && player.x < p.x + p.width;
+                
+                if (
+                    horizontalOverlap &&
+                    player.velY >= 0 && 
+                    player.y + player.height > p.y && 
+                    player.y + player.height - player.velY <= p.y 
+                ) {
+                    player.y = p.y - player.height; 
+                    player.velY = 0;
+                    onPlatform = true;
+                    return onPlatform; 
+                }
+            }
+            
+            if (player.y >= PLAYER_BOTTOM_Y - player.height) {
+                player.y = PLAYER_BOTTOM_Y - player.height;
+                onPlatform = true;
+                player.velY = 0;
+            }
+
+            return onPlatform;
+        }
+
+        function checkBossGrounding() {
+            if (boss.currentPhase === 1) {
+                 return boss.moveState === 'ATTACKING'; 
+            }
+            
+            let onGround = false;
+            
+            for (let p of platforms) {
+                const horizontalOverlap = boss.x + boss.width > p.x && boss.x < p.x + p.width;
+
+                if (
+                    horizontalOverlap &&
+                    boss.velY >= 0 && 
+                    boss.y + boss.height > p.y && 
+                    boss.y + boss.height - boss.velY <= p.y 
+                ) {
+                    const groundLevel = p.y;
+                    boss.y = groundLevel - boss.height; 
+                    boss.velY = 0;
+                    onGround = true;
+                    return onGround;
+                }
+            }
+            
+            if (boss.y >= BOSS_BOTTOM_Y - boss.height) {
+                boss.y = BOSS_BOTTOM_Y - boss.height;
+                boss.velY = 0;
+                onGround = true;
+            }
+            
+            return onGround;
+        }
+
+        function updatePlayerMovement() {
+            // Player movement is only halted during boss transformation/intro, 
+            // but gravity/physics still run to keep player grounded.
+            const isControlHalted = boss.moveState === 'TRANSFORMING' || gameState === 'INTRO';
+
+            if (isControlHalted) {
+                 player.velX = 0;
+            } else {
+
+                player.isCrouching = (keys['ArrowDown'] || keys['KeyS']) && player.grounded;
+                if (player.isCrouching) {
+                    if (player.height !== player.crouchHeight) {
+                        player.y += player.originalHeight - player.crouchHeight;
+                        player.height = player.crouchHeight;
+                    }
+                } else {
+                    if (player.height !== player.originalHeight) {
+                        player.height = player.originalHeight;
+                        player.y -= player.originalHeight - player.crouchHeight;
+                    }
+                }
+
+                if (player.isDashing) {
+                    if (player.dashDuration > 0) {
+                        player.dashDuration--;
+                        player.velX = player.facingRight ? player.dashSpeed : -player.dashSpeed;
+                    } else {
+                        player.isDashing = false;
+                    }
+                } else {
+                    player.velX = 0;
+                    if (!player.isCrouching && !player.isLocked) { 
+                        if (keys['ArrowLeft'] || keys['KeyA']) {
+                            player.velX = -player.speed;
+                            player.facingRight = false;
+                        }
+                        if (keys['ArrowRight'] || keys['KeyD']) {
+                            player.velX = player.speed;
+                            player.facingRight = true;
+                        }
+                    }
+                }
+                
+                if ((keys['ArrowUp'] || keys['KeyW']) && player.grounded) {
+                    player.velY = player.jump;
+                    player.grounded = false;
+                }
+            }
+
+            // Apply physics (gravity always runs unless manually stopped, which we don't want here)
+            player.x += player.velX;
+            player.velY += gravity;
+            player.y += player.velY;
+
+            player.grounded = checkPlatformCollision();
+            
+            if (player.x < 0) player.x = 0;
+            if (player.x > canvas.width - player.width) player.x = canvas.width - player.width;
+        }
+
+        function updateBossIntro() {
+            if (boss.isMovingIntro) {
+                if (boss.y > BOSS_BOTTOM_Y - boss.height) {
+                    boss.y -= 3; 
+                } else {
+                    boss.y = BOSS_BOTTOM_Y - boss.height;
+                    boss.isMovingIntro = false;
+                    
+                    boss.targetSpot = GROUND_SPOTS[0];
+                    
+                    boss.x = boss.targetSpot.x;
+                    boss.y = BOSS_BOTTOM_Y + boss.height; 
+                    boss.moveState = 'RISING'; 
+                    boss.attackTimer = 0;
+                    
+                    gameState = 'FIGHT'; 
+                }
+            }
+        }
+
+        function startPhaseTwoTransition() {
+            // Immediately stop current boss actions and set up transformation
+            boss.currentPhase = 1.5; // Use an interim phase number for clearer state separation
+            boss.velX = 0;
+            boss.velY = 0;
+            boss.attackTimer = 0;
+            boss.moveState = 'TRANSFORMING';
+            
+            // Clear all current enemy projectiles
+            enemyProjectiles = []; 
+            bullets = []; 
+            
+            // Set transformation target: center of the screen, floating slightly above the ground
+            boss.targetX = canvas.width / 2 - boss.originalWidth / 4; 
+            boss.targetY = BOSS_BOTTOM_Y - boss.originalHeight - 50; 
+            
+            // Reset transition timer
+            phaseTransitionTimer = PHASE_TRANSITION_TIME;
+        }
+        
+        function handleBossTransformation() {
+            // 1. Move boss to the center target position (smoothly)
+            boss.x += (boss.targetX - boss.x) * 0.1;
+            boss.y += (boss.targetY - boss.y) * 0.1;
+            
+            // 2. Scale the boss down for transformation effect
+            const scaleFactor = phaseTransitionTimer / PHASE_TRANSITION_TIME; // 1.0 down to 0.0
+            const currentScale = 1 - Math.cos(Math.PI * (1 - scaleFactor)); // Slow start, fast middle, slow end scaling curve
+            
+            // Ensure width/height smoothly decrease and increase
+            if (phaseTransitionTimer > PHASE_TRANSITION_TIME / 2) {
+                // Shrinking half
+                boss.width = boss.originalWidth * (0.5 + 0.5 * (scaleFactor * 2 - 1));
+                boss.height = boss.originalHeight * (0.5 + 0.5 * (scaleFactor * 2 - 1));
+            } else {
+                // Expanding half (towards final Phase 2 size)
+                const phase2Scale = (PHASE_TRANSITION_TIME / 2 - phaseTransitionTimer) / (PHASE_TRANSITION_TIME / 2);
+                boss.width = boss.originalWidth * (0.5 + 0.5 * phase2Scale);
+                boss.height = boss.originalHeight * (0.5 + 0.5 * phase2Scale);
+            }
+
+            // 3. Decrement timer
+            phaseTransitionTimer--;
+            
+            // 4. Finalize
+            if (phaseTransitionTimer <= 0) {
+                finalizePhaseTwoTransition();
+            }
+        }
+        
+        function finalizePhaseTwoTransition() {
+            boss.currentPhase = 2;
+            boss.color = 'purple'; 
+            boss.width = boss.originalWidth;
+            boss.height = boss.originalHeight;
+            
+            boss.x = canvas.width / 2 - boss.width / 2; 
+            boss.y = BOSS_BOTTOM_Y - boss.height; 
+            
+            boss.isGrounded = true; 
+            boss.attackRate = 90; 
+            boss.jumpCooldown = 60; 
+            boss.isJumping = false;
+            boss.moveState = 'ATTACKING'; // Start Phase 2 attacking state
+            gameState = 'FIGHT';
+        }
+        
+        // --- PHASE 1 (ONION) MOVEMENT: DIG AND ATTACK FROM MAIN GROUND ---
+        function handlePhaseOneMovement() {
+            boss.velX = 0;
+            
+            const stopY = BOSS_BOTTOM_Y - boss.height; 
+
+            if (boss.moveState === 'RISING') {
+                boss.velY = -5; 
+                
+                if (boss.y <= stopY) {
+                    boss.y = stopY; 
+                    boss.velY = 0;
+                    boss.moveState = 'ATTACKING';
+                    boss.digTimer = boss.maxDigTime; 
+                    boss.attackTimer = 0; 
+                }
+
+            } else if (boss.moveState === 'ATTACKING') {
+                boss.digTimer--;
+                
+                if (boss.digTimer <= 0) {
+                    boss.moveState = 'DIGGING';
+                    boss.velY = 15; 
+                }
+
+            } else if (boss.moveState === 'DIGGING') {
+                if (boss.y > canvas.height + 20) {
+                    const currentTargetIndex = GROUND_SPOTS.findIndex(spot => spot.x === boss.targetSpot.x);
+                    const newTargetIndex = 1 - currentTargetIndex; 
+                    
+                    boss.targetSpot = GROUND_SPOTS[newTargetIndex];
+                    
+                    boss.x = boss.targetSpot.x; 
+                    boss.y = BOSS_BOTTOM_Y + boss.height; 
+                    boss.moveState = 'RISING'; 
+                }
+            }
+            
+            if (boss.moveState !== 'ATTACKING') {
+                boss.velY += gravity;
+                boss.y += boss.velY;
+            }
+            
+            // --- ATTACK LOGIC ---
+            if (boss.moveState === 'ATTACKING') {
+                 boss.attackTimer++;
+                 if (boss.attackTimer >= boss.attackRate) {
+                     boss.attackTimer = 0;
+                     const isParryable = Math.random() < 0.2;
+                     const angle = angleTo(boss.x + boss.width/2, boss.y + boss.height/2, player.x + player.width/2, player.y + player.height/2);
+                     
+                     enemyProjectiles.push({
+                         x: boss.x + boss.width/2, y: boss.y + boss.height/2,
+                         angle: angle, 
+                         velX: Math.cos(angle) * boss.phaseOneProjectileSpeed, 
+                         velY: Math.sin(angle) * boss.phaseOneProjectileSpeed,
+                         radius: isParryable ? 10 : 15,
+                         color: isParryable ? 'pink' : 'black',
+                         isParryable: isParryable, isParried: false
+                     });
+                 }
+            }
+        }
+        
+        // --- PHASE 2 (POTATO) MOVEMENT: RUN AND JUMP ---
+        function handlePhaseTwoMovement() {
+            boss.isGrounded = checkBossGrounding();
+
+            if (boss.isGrounded) {
+                boss.isJumping = false;
+                
+                const playerCenterX = player.x + player.width / 2;
+                const bossCenterX = boss.x + boss.width / 2;
+                const dx = playerCenterX - bossCenterX;
+                
+                if (Math.abs(dx) > 10) {
+                    boss.velX = Math.sign(dx) * boss.bossRunSpeed;
+                } else {
+                    boss.velX = 0; 
+                }
+                
+                boss.jumpCooldown--;
+                const playerIsAbove = player.y + player.height < boss.y + boss.height - 20; 
+                
+                if (boss.jumpCooldown <= 0 && (playerIsAbove || Math.random() < 0.005)) { 
+                    boss.velY = -18; 
+                    boss.isJumping = true;
+                    boss.jumpCooldown = boss.jumpRate;
+                }
+                
+            } else {
+                boss.isJumping = true;
+                boss.velX *= friction; 
+            }
+            
+            boss.velY += gravity;
+            boss.x += boss.velX;
+            boss.y += boss.velY;
+            
+            if (boss.x < 0) boss.x = 0;
+            if (boss.x > canvas.width - boss.width) boss.x = canvas.width - boss.width;
+
+            // --- ATTACK LOGIC (Faster projectiles) ---
+            boss.attackTimer++;
+            if (boss.attackTimer >= boss.attackRate) {
+                boss.attackTimer = 0;
+                const isParryable = Math.random() < 0.2;
+                const angle = angleTo(boss.x + boss.width/2, boss.y + boss.height/2, player.x + player.width/2, player.y + player.height/2);
+                
+                enemyProjectiles.push({
+                    x: boss.x + boss.width/2, y: boss.y + boss.height/2,
+                    angle: angle, 
+                    velX: Math.cos(angle) * boss.phaseTwoProjectileSpeed, 
+                    velY: Math.sin(angle) * boss.phaseTwoProjectileSpeed, 
+                    radius: isParryable ? 10 : 15,
+                    color: isParryable ? 'pink' : 'black',
+                    isParryable: isParryable, isParried: false
+                });
+            }
+
+            // Collision damage check
+            if (boss.isJumping && 
+                player.x < boss.x + boss.width && 
+                player.x + player.width > boss.x && 
+                player.y < boss.y + boss.height && 
+                player.y + player.height > boss.y) {
+                    
+                takeDamage(player, 1, true);
+            }
+        }
+
+        function updateBossFight() {
+            if (boss.moveState === 'TRANSFORMING') {
+                handleBossTransformation();
+            }
+            else if (boss.currentPhase === 1) {
+                handlePhaseOneMovement();
+            } else if (boss.currentPhase === 2) {
+                handlePhaseTwoMovement();
+            }
+        }
+
+        function update() {
+            if (gameState === 'GAME_OVER' || gameState === 'BOSS_DEFEATED') return;
+
+            // Transition Trigger Check (Phase 1 to Phase 2)
+            if (boss.currentPhase === 1 && boss.hp <= PHASE_TWO_HP) {
+                startPhaseTwoTransition();
+            }
+
+            if (gameState === 'INTRO') {
+                updateBossIntro();
+            }
+            
+            // --- CORE UPDATES ---
+            
+            // Update player movement and physics
+            updatePlayerMovement();
+
+            if (gameState === 'FIGHT' || boss.moveState === 'TRANSFORMING') { 
+                // Run boss fight/transition logic
+                
+                if (player.shotTimer > 0) player.shotTimer--; 
+                if (player.invulnTimer > 0) player.invulnTimer--; 
+                if (boss.damageFlashTimer > 0) boss.damageFlashTimer--; 
+                
+                if (!player.canDash && !player.isDashing) {
+                    if (player.dashCooldown > 0) { player.dashCooldown--; } 
+                    else { player.canDash = true; player.dashCooldown = 60; }
+                }
+                
+                // Only fire if not transforming
+                if (boss.moveState !== 'TRANSFORMING') {
+                     firePlayerBullet(); 
+                }
+
+                updateBossFight();
+            }
+
+
+            // Projectile Updates (Movement)
+            for (let i = 0; i < bullets.length; i++) {
+                const bullet = bullets[i];
+                
+                // Only process movement and collisions if not transforming (Projectiles cleared at start of transform)
+                if (boss.moveState !== 'TRANSFORMING') {
+                    const weaponProps = weapons[bullet.type];
+
+                    if (weaponProps.isHoming && boss.hp > 0 && gameState === 'FIGHT') {
+                        const targetAngle = angleTo(bullet.x, bullet.y, boss.x + boss.width/2, boss.y + boss.height/2);
+                        const diffAngle = targetAngle - bullet.angle;
+                        bullet.angle += Math.max(-0.1, Math.min(0.1, diffAngle)); 
+                        bullet.velX = Math.cos(bullet.angle) * weaponProps.speed;
+                        bullet.velY = Math.sin(bullet.angle) * weaponProps.speed;
+                    }
+                    
+                    bullet.x += bullet.velX;
+                    bullet.y += bullet.velY;
+                    
+                    if (boss.hp > 0 && bullet.x > boss.x && bullet.x < boss.x + boss.width &&
+                        bullet.y > boss.y && bullet.y < boss.y + boss.height) {
+                        
+                        takeDamage(boss, bullet.damage);
+                        bullets.splice(i, 1);
+                        i--;
+                        continue;
+                    }
+                    
+                    if (bullet.x < 0 || bullet.x > canvas.width || bullet.y < 0 || bullet.y > canvas.height) {
+                        bullets.splice(i, 1);
+                        i--;
+                    }
+                } else {
+                    // Bullets were cleared in startPhaseTwoTransition, but just in case, this should clear them
+                    bullets.splice(i, 1);
+                    i--;
+                }
+            }
+            
+            for (let i = 0; i < enemyProjectiles.length; i++) {
+                const proj = enemyProjectiles[i];
+                
+                // Only process movement and collisions if not transforming
+                if (boss.moveState !== 'TRANSFORMING') {
+                    const dx = player.x + player.width/2 - proj.x;
+                    const dy = player.y + player.height/2 - proj.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+                    
+                    proj.x += proj.velX;
+                    proj.y += proj.velY;
+                    
+                    if (distance < player.width/2 + proj.radius) { 
+                        if (player.isDashing) {
+                            if (proj.isParryable && !proj.isParried) {
+                                takeDamage(boss, PARRY_DAMAGE); 
+                                proj.isParried = true;
+                                proj.color = 'yellow';
+                                proj.velX *= -5;
+                                proj.velY *= -5;
+                                proj.isParryable = false;
+                            } else {
+                                enemyProjectiles.splice(i, 1);
+                                i--;
+                            }
+                        } else if (gameState === 'FIGHT') {
+                            takeDamage(player, 1); 
+                            enemyProjectiles.splice(i, 1);
+                            i--;
+                        }
+                        continue;
+                    }
+                    
+                    if (proj.isParried && boss.hp > 0 && proj.x > boss.x && proj.x < boss.x + boss.width && proj.y > boss.y && proj.y < boss.y + boss.height) {
+                        takeDamage(boss, PARRY_DAMAGE * 0.5); 
+                        enemyProjectiles.splice(i, 1);
+                        i--;
+                    }
+                    
+                    if (proj.x < -proj.radius || proj.x > canvas.width + proj.radius || proj.y < -proj.radius || proj.y > canvas.height + proj.radius) {
+                        enemyProjectiles.splice(i, 1);
+                        i--;
+                    }
+                } else {
+                    // Projectiles should be cleared, but this handles any stragglers
+                    enemyProjectiles.splice(i, 1);
+                    i--;
+                }
+            }
+        }
+        
+        // --- DRAWING FUNCTIONS ---
+
+        function drawPlatforms() {
+            ctx.fillStyle = "#8B4513"; 
+            for (let p of platforms) {
+                ctx.fillRect(p.x, p.y, p.width, p.height);
+                ctx.strokeStyle = "black";
+                ctx.lineWidth = 2;
+                ctx.strokeRect(p.x, p.y, p.width, p.height);
+            }
+        }
+
+        function drawCuphead(x, y, width, height, isRunning, isDashing, facingRight, isCrouching, isInvulnerable) {
+            
+            // Player is only hidden during the boss's transformation phase
+            if (boss.moveState === 'TRANSFORMING') return; 
+            if (isInvulnerable && player.invulnTimer % 10 < 5) return; 
+
+            ctx.save();
+            ctx.translate(x, y);
+
+            const flip = facingRight ? 1 : -1;
+            const centerOffset = width / 2;
+            const headCenter = { x: centerOffset, y: height * 0.25 };
+            let bodyY = height * 0.6; 
+            const headRadius = width / 2;
+            
+            let leanX = 0;
+            if (isDashing) {
+                leanX = flip * 5; 
+            } else if (!player.grounded) {
+                bodyY -= 5; 
+            }
+
+            ctx.fillStyle = isInvulnerable ? 'red' : 'white';
+            ctx.beginPath();
+            ctx.arc(headCenter.x + leanX, headCenter.y, headRadius, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = 'black';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            ctx.fillRect(headCenter.x + leanX + (headRadius + 5) * flip, headCenter.y - headRadius + 5, 5, 20); 
+
+            ctx.fillStyle = isInvulnerable ? 'white' : 'red';
+            const bodyWidth = width * 0.75;
+            const bodyHeight = height * 0.4;
+            ctx.fillRect(centerOffset - bodyWidth/2 + leanX, bodyY, bodyWidth, bodyHeight);
+            
+            ctx.fillStyle = 'black';
+            const waistHeight = height * 0.05;
+            ctx.fillRect(centerOffset - bodyWidth/2 + leanX, bodyY + bodyHeight, bodyWidth, waistHeight);
+
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = 'white';
+            
+            const hipY = bodyY + bodyHeight + waistHeight;
+            let walkCycle = isRunning ? Math.sin(Date.now() / 100) * 0.2 : 0;
+            
+            if (player.grounded && !isCrouching) {
+                const kneeY = hipY + 10;
+                const footY = hipY + 25;
+                
+                ctx.beginPath();
+                ctx.moveTo(centerOffset - 5 + leanX, hipY);
+                ctx.bezierCurveTo(centerOffset - 5 + leanX + walkCycle * 20 * flip, kneeY, centerOffset - 5 + leanX + walkCycle * 20 * flip, kneeY + 5, centerOffset - 5 + leanX, footY);
+                ctx.stroke();
+                
+                ctx.beginPath();
+                ctx.moveTo(centerOffset + 5 + leanX, hipY);
+                ctx.bezierCurveTo(centerOffset + 5 + leanX - walkCycle * 20 * flip, kneeY, centerOffset + 5 + leanX - walkCycle * 20 * flip, kneeY + 5, centerOffset + 5 + leanX, footY);
+                ctx.stroke();
+            } 
+            else if (!player.grounded) {
+                const kneeY = hipY + 5;
+                const footY = hipY + 10;
+                
+                ctx.beginPath();
+                ctx.moveTo(centerOffset - 5 + leanX, hipY);
+                ctx.lineTo(centerOffset - 5 + leanX, kneeY);
+                ctx.lineTo(centerOffset - 10 + leanX, footY); 
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.moveTo(centerOffset + 5 + leanX, hipY);
+                ctx.lineTo(centerOffset + 5 + leanX, kneeY);
+                ctx.lineTo(centerOffset + 10 + leanX, footY);
+                ctx.stroke();
+            }
+            
+            const shoulderY = bodyY + 5;
+            ctx.beginPath();
+            ctx.moveTo(centerOffset + bodyWidth/2 + leanX, shoulderY);
+            ctx.bezierCurveTo(centerOffset + bodyWidth/2 + leanX + walkCycle * 20 * flip, shoulderY + 15, centerOffset + bodyWidth/2 + leanX, shoulderY + 35, centerOffset + bodyWidth/2 + 10 * flip + leanX, shoulderY + 30);
+            ctx.stroke();
+            
+            if (isDashing) {
+                ctx.fillStyle = 'rgba(255, 255, 0, 0.5)';
+                ctx.fillRect(-10, -20, width + 20, height + 20);
+            }
+            
+            ctx.restore();
+        }
+        
+        function drawProjectile(bullet) {
+            // Projectiles are cleared during transformation, so we don't need a check here
+            ctx.fillStyle = bullet.color;
+
+            if (bullet.type === 'chaser') {
+                 ctx.beginPath();
+                 ctx.arc(bullet.x, bullet.y, bullet.width/2, 0, Math.PI * 2);
+                 ctx.fill();
+            } else {
+                if (bullet.velY !== 0) { 
+                     ctx.fillRect(bullet.x, bullet.y, bullet.height, bullet.width);
+                } else { 
+                     ctx.fillRect(bullet.x, bullet.y, bullet.width, bullet.height);
+                }
+            }
+        }
+        
+        function drawEnemyProjectile(proj) {
+            // Projectiles are cleared during transformation, so we don't need a check here
+            ctx.fillStyle = proj.color;
+            ctx.beginPath();
+            ctx.arc(proj.x, proj.y, proj.radius, 0, Math.PI * 2);
+            ctx.fill();
+            
+            ctx.fillStyle = proj.isParried ? 'black' : 'white';
+            ctx.beginPath();
+            ctx.arc(proj.x, proj.y, 5, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        function drawBoss(boss) {
+            const stopY = BOSS_BOTTOM_Y - boss.originalHeight;
+            
+            let bossIsVisible = true;
+            if (boss.currentPhase === 1) {
+                const visibleHeight = BOSS_BOTTOM_Y - boss.y;
+                if (visibleHeight <= 0 && boss.moveState !== 'TRANSFORMING') bossIsVisible = false;
+            }
+            if (!bossIsVisible) return;
+
+            // Base color depends on phase
+            let bossColor = boss.currentPhase === 2 ? 'purple' : 'orange';
+            
+            if (boss.moveState === 'TRANSFORMING') {
+                // Flashing and color shift during transformation
+                const t = phaseTransitionTimer / 10;
+                bossColor = t % 2 < 1 ? 'yellow' : 'red';
+            } else if (boss.damageFlashTimer > 0) {
+                bossColor = 'white';
+            }
+            
+            ctx.save();
+            // Calculate center based on current, possibly scaled size
+            ctx.translate(boss.x + boss.width / 2, boss.y + boss.height / 2);
+
+            let radiusX = boss.width / 2;
+            let radiusY = boss.height / 2;
+            
+            ctx.beginPath();
+            ctx.ellipse(0, 0, radiusX, radiusY, 0, 0, Math.PI * 2);
+
+            if (boss.currentPhase === 1 && boss.y > stopY && boss.moveState !== 'TRANSFORMING') {
+                ctx.clip(); 
+            }
+            
+            ctx.fillStyle = bossColor;
+            ctx.fill();
+            ctx.strokeStyle = 'black';
+            ctx.lineWidth = 4;
+            ctx.stroke();
+
+            // Eyes/Features scale with the boss
+            const featureScale = boss.width / boss.originalWidth;
+
+            ctx.fillStyle = 'white';
+            ctx.beginPath();
+            ctx.arc(-radiusX * 0.3, -radiusY * 0.2, 8 * featureScale, 0, Math.PI * 2);
+            ctx.arc(radiusX * 0.3, -radiusY * 0.2, 8 * featureScale, 0, Math.PI * 2);
+            ctx.fill();
+            
+            ctx.fillStyle = 'black';
+            ctx.beginPath();
+            ctx.arc(-radiusX * 0.3, -radiusY * 0.2, 4 * featureScale, 0, Math.PI * 2);
+            ctx.arc(radiusX * 0.3, -radiusY * 0.2, 4 * featureScale, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.restore();
+
+            // Boss HP Bar
+            if (gameState === 'FIGHT' || boss.moveState === 'TRANSFORMING' || gameState === 'BOSS_DEFEATED') {
+                const hpBarY = stopY - 20;
+                ctx.fillStyle = "red";
+                // HP bar size is always based on the ORIGINAL width for consistency
+                ctx.fillRect(boss.x + (boss.width - boss.originalWidth) / 2, hpBarY, boss.originalWidth, 10);
+                ctx.fillStyle = "green";
+                ctx.fillRect(boss.x + (boss.width - boss.originalWidth) / 2, hpBarY, (boss.hp / BOSS_HP_MULTIPLIER) * 10, 10); 
+            }
+        }
+
+        function drawHitboxes() {
+            if (!SHOW_HITBOXES) return;
+            // Draw hitboxes during transformation as well to show its movement
+            
+            ctx.lineWidth = 1;
+
+            if (boss.moveState !== 'TRANSFORMING') {
+                ctx.strokeStyle = 'green';
+                ctx.strokeRect(player.x, player.y, player.width, player.height);
+            }
+
+            const stopY = BOSS_BOTTOM_Y - boss.height;
+            const isBossVisible = boss.currentPhase === 2 || boss.y <= stopY || boss.moveState === 'TRANSFORMING';
+
+            if ((boss.hp > 0 || gameState === 'INTRO') && isBossVisible) {
+                ctx.strokeStyle = 'red';
+                ctx.strokeRect(boss.x, boss.y, boss.width, boss.height);
+            }
+            
+            // Projectiles and their hitboxes are cleared during transformation
+            for (let b of bullets) {
+                ctx.strokeStyle = 'blue';
+                if (b.type === 'chaser') {
+                    ctx.beginPath();
+                    ctx.arc(b.x, b.y, b.width / 2, 0, Math.PI * 2);
+                    ctx.stroke();
+                } else {
+                    if (b.velY !== 0) { 
+                        ctx.strokeRect(b.x, b.y, b.height, b.width);
+                    } else { 
+                        ctx.strokeRect(b.x, b.y, b.width, b.height);
+                    }
+                }
+            }
+
+            for (let p of enemyProjectiles) {
+                ctx.strokeStyle = p.isParryable ? 'pink' : 'yellow';
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+                ctx.stroke();
+            }
+        }
+        
+        function drawUI() {
+            ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+            ctx.fillRect(0, 0, canvas.width, 65); 
+            
+            ctx.fillStyle = "white";
+            ctx.font = "16px Arial";
+            ctx.textAlign = 'left';
+
+            // UI Row 1 (Y=20): Controls
+            ctx.fillText("Controls: WASD/Arrows Move | SPACE Shoot | SHIFT Dash/Parry | Z Lock Shot | T Toggle Hitboxes", 10, 20);
+            
+            // UI Row 2 (Y=45): Player Stats (Left)
+            ctx.fillText(`Weapon: ${player.weapon.toUpperCase()} | HP: ${player.hp}`, 10, 45);
+
+            // UI Row 2 (Y=45): Boss Status (Center)
+            let bossStatusText = `Boss Phase: ${boss.currentPhase} (HP: ${Math.ceil(boss.hp / BOSS_HP_MULTIPLIER)})`;
+            if (gameState === 'BOSS_DEFEATED') bossStatusText = "BOSS DEFEATED!";
+            if (gameState === 'INTRO') bossStatusText = "BOSS INTRO...";
+            if (boss.moveState === 'TRANSFORMING') bossStatusText = `PHASE 2 TRANSFORMING... (${Math.ceil(phaseTransitionTimer / 60)}s)`;
+
+            ctx.textAlign = 'center';
+            ctx.fillText(bossStatusText, canvas.width / 2, 45);
+            
+            // UI Row 1 (Y=20): Hitbox Status (Far Right)
+            ctx.textAlign = 'right';
+            ctx.fillStyle = SHOW_HITBOXES ? "orange" : "white";
+            ctx.fillText(`HITBOXES: ${SHOW_HITBOXES ? 'ON' : 'OFF'}`, canvas.width - 10, 20);
+
+            // UI Row 2 (Y=45): Dash Status (Far Right)
+            ctx.fillStyle = player.canDash ? "lime" : "red";
+            ctx.fillText("DASH: " + (player.canDash ? "READY" : "CD " + player.dashCooldown), canvas.width - 10, 45);
+            
+            ctx.textAlign = 'left'; 
+        }
+
+        function draw() {
+            ctx.fillStyle = "#ADD8E6"; 
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = "#3CB371"; 
+            ctx.fillRect(0, PLAYER_BOTTOM_Y, canvas.width, 100);
+
+            drawPlatforms();
+            
+            let isRunning = Math.abs(player.velX) > 1 && player.grounded && !player.isCrouching;
+
+            drawCuphead(player.x, player.y, player.width, player.height, isRunning, player.isDashing, player.facingRight, player.isCrouching, player.invulnTimer > 0);
+            
+            drawBoss(boss); 
+
+            for (let b of bullets) {
+                drawProjectile(b);
+            }
+            
+            for (let p of enemyProjectiles) {
+                drawEnemyProjectile(p);
+            }
+            
+            drawHitboxes();
+            drawUI(); 
+
+            if (gameState === 'GAME_OVER') {
+                ctx.fillStyle = "rgba(0, 0, 0, 0.8)";
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = "red";
+                ctx.font = "80px 'Arial Black'";
+                ctx.textAlign = 'center';
+                ctx.fillText("YOU DIED", canvas.width / 2, canvas.height / 2);
+            }
+            if (gameState === 'BOSS_DEFEATED') {
+                ctx.fillStyle = "rgba(0, 0, 0, 0.8)";
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = "yellow";
+                ctx.font = "80px 'Arial Black'";
+                ctx.textAlign = 'center';
+                ctx.fillText("K.O.!", canvas.width / 2, canvas.height / 2 - 40);
+                ctx.font = "30px 'Arial Black'";
+                ctx.fillText("VICTORY ACHIEVED", canvas.width / 2, canvas.height / 2 + 30);
+            }
+            ctx.textAlign = 'left'; 
+        }
+
+        function loop() {
+            update();
+            draw();
+            requestAnimationFrame(loop);
+        }
+
+        loop();
+    </script>
+</body>
+</html>
